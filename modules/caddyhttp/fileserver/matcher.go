@@ -91,7 +91,7 @@ func (MatchFile) CaddyModule() caddy.ModuleInfo {
 
 // UnmarshalCaddyfile sets up the matcher from Caddyfile tokens. Syntax:
 //
-//     file {
+//     file <files...> {
 //         root <path>
 //         try_files <files...>
 //         try_policy first_exist|smallest_size|largest_size|most_recently_modified
@@ -99,6 +99,7 @@ func (MatchFile) CaddyModule() caddy.ModuleInfo {
 //
 func (m *MatchFile) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
+		m.TryFiles = append(m.TryFiles, d.RemainingArgs()...)
 		for d.NextBlock(0) {
 			switch d.Val() {
 			case "root":
@@ -107,7 +108,7 @@ func (m *MatchFile) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				m.Root = d.Val()
 			case "try_files":
-				m.TryFiles = d.RemainingArgs()
+				m.TryFiles = append(m.TryFiles, d.RemainingArgs()...)
 				if len(m.TryFiles) == 0 {
 					return d.ArgErr()
 				}
@@ -116,11 +117,13 @@ func (m *MatchFile) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				m.TryPolicy = d.Val()
-			case "split":
+			case "split_path":
 				m.SplitPath = d.RemainingArgs()
 				if len(m.SplitPath) == 0 {
 					return d.ArgErr()
 				}
+			default:
+				return d.Errf("unrecognized subdirective: %s", d.Val())
 			}
 		}
 	}
@@ -278,9 +281,8 @@ func strictFileExists(file string) bool {
 // in the split value. Returns the path as-is if the
 // path cannot be split.
 func (m MatchFile) firstSplit(path string) string {
-	lowerPath := strings.ToLower(path)
 	for _, split := range m.SplitPath {
-		if idx := strings.Index(lowerPath, strings.ToLower(split)); idx > -1 {
+		if idx := indexFold(path, split); idx > -1 {
 			pos := idx + len(split)
 			// skip the split if it's not the final part of the filename
 			if pos != len(path) && !strings.HasPrefix(path[pos:], "/") {
@@ -290,6 +292,19 @@ func (m MatchFile) firstSplit(path string) string {
 		}
 	}
 	return path
+}
+
+// There is no strings.IndexFold() function like there is strings.EqualFold(),
+// but we can use strings.EqualFold() to build our own case-insensitive
+// substring search (as of Go 1.14).
+func indexFold(haystack, needle string) int {
+	nlen := len(needle)
+	for i := 0; i+nlen < len(haystack); i++ {
+		if strings.EqualFold(haystack[i:i+nlen], needle) {
+			return i
+		}
+	}
+	return -1
 }
 
 const (

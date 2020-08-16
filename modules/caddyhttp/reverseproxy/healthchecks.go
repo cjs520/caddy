@@ -19,10 +19,12 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"time"
 
@@ -76,7 +78,6 @@ type ActiveHealthChecks struct {
 	// body of a healthy backend.
 	ExpectBody string `json:"expect_body,omitempty"`
 
-	stopChan   chan struct{}
 	httpClient *http.Client
 	bodyRegexp *regexp.Regexp
 	logger     *zap.Logger
@@ -113,7 +114,8 @@ type PassiveHealthChecks struct {
 
 // CircuitBreaker is a type that can act as an early-warning
 // system for the health checker when backends are getting
-// overloaded.
+// overloaded. This interface is still experimental and is
+// subject to change.
 type CircuitBreaker interface {
 	OK() bool
 	RecordMetric(statusCode int, latency time.Duration)
@@ -123,14 +125,18 @@ type CircuitBreaker interface {
 // regular basis and blocks until
 // h.HealthChecks.Active.stopChan is closed.
 func (h *Handler) activeHealthChecker() {
+	defer func() {
+		if err := recover(); err != nil {
+			log.Printf("[PANIC] active health checks: %v\n%s", err, debug.Stack())
+		}
+	}()
 	ticker := time.NewTicker(time.Duration(h.HealthChecks.Active.Interval))
 	h.doActiveHealthCheckForAllHosts()
 	for {
 		select {
 		case <-ticker.C:
 			h.doActiveHealthCheckForAllHosts()
-		case <-h.HealthChecks.Active.stopChan:
-			// TODO: consider using a Context for cancellation instead
+		case <-h.ctx.Done():
 			ticker.Stop()
 			return
 		}
@@ -142,6 +148,11 @@ func (h *Handler) activeHealthChecker() {
 func (h *Handler) doActiveHealthCheckForAllHosts() {
 	for _, upstream := range h.Upstreams {
 		go func(upstream *Upstream) {
+			defer func() {
+				if err := recover(); err != nil {
+					log.Printf("[PANIC] active health check: %v\n%s", err, debug.Stack())
+				}
+			}()
 			networkAddr := upstream.Dial
 			addr, err := caddy.ParseNetworkAddress(networkAddr)
 			if err != nil {
@@ -185,7 +196,7 @@ func (h *Handler) doActiveHealthCheckForAllHosts() {
 func (h *Handler) doActiveHealthCheck(dialInfo DialInfo, hostAddr string, host Host) error {
 	// create the URL for the request that acts as a health check
 	scheme := "http"
-	if ht, ok := h.Transport.(*http.Transport); ok && ht.TLSClientConfig != nil {
+	if ht, ok := h.Transport.(TLSTransport); ok && ht.TLSEnabled() {
 		// this is kind of a hacky way to know if we should use HTTPS, but whatever
 		scheme = "https"
 	}
@@ -328,19 +339,23 @@ func (h *Handler) countFailure(upstream *Upstream) {
 	if err != nil {
 		h.HealthChecks.Passive.logger.Error("could not count failure",
 			zap.String("host", upstream.Dial),
-			zap.Error(err),
-		)
+			zap.Error(err))
+		return
 	}
 
 	// forget it later
 	go func(host Host, failDuration time.Duration) {
+		defer func() {
+			if err := recover(); err != nil {
+				log.Printf("[PANIC] health check failure forgetter: %v\n%s", err, debug.Stack())
+			}
+		}()
 		time.Sleep(failDuration)
 		err := host.CountFail(-1)
 		if err != nil {
 			h.HealthChecks.Passive.logger.Error("could not forget failure",
 				zap.String("host", upstream.Dial),
-				zap.Error(err),
-			)
+				zap.Error(err))
 		}
 	}(upstream.Host, failDuration)
 }
